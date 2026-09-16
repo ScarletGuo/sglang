@@ -8,6 +8,7 @@
 //! All parameters come from the runtime spec; nothing is hardcoded per model.
 
 use crate::common::{par, resize, token_layout};
+use crate::grid_packing::{GridPackedOutput, pack_grid_output};
 use crate::pipeline::{
     DecodedMedia, Geometry, MmFamilyProcessor, PositionOutput, ProcessedItem, Tensor, TensorData,
     TokenLayout,
@@ -342,60 +343,13 @@ pub fn mrope_image_only(
     Ok((pos, max + 1 - len as i64))
 }
 
-/// The qwen scheduler-drain shape, extracted from the generic driver
-/// [`Output`](crate::driver::Output). Shared by `sglang-server`'s MM worker
-/// and the parity binding so the mapping can't drift. TODO(mm-families):
-/// replace with a generic named-tensor handoff once a second family needs a
-/// different shape.
-pub struct QwenPackedOutput {
-    pub input_ids: Vec<i32>,
-    /// All items' `pixel_values`, concatenated in prompt order; flattened
-    /// `[Σ t·h·w, 3·temporal_patch_size·patch_size²]`.
-    pub features: Vec<f32>,
-    /// Per item `[t, h, w]` patch grid.
-    pub grids: Vec<[u32; 3]>,
-    pub hashes: Vec<u64>,
-    /// Per item inclusive token range in `input_ids`.
-    pub offsets: Vec<(u32, u32)>,
-    /// Flattened row-major `[3, input_len]` M-RoPE positions.
-    pub mrope: Vec<i64>,
-    pub mrope_delta: i64,
-}
+/// Retained name of the packed output; `sglang-mm`'s Qwen entry points stay
+/// usable for out-of-tree callers.
+pub type QwenPackedOutput = GridPackedOutput;
 
+/// Retained one-argument packing entry point, kept for out-of-tree callers.
 pub fn pack_output(output: crate::driver::Output) -> Result<QwenPackedOutput, String> {
-    use crate::pipeline::PositionOutput;
-
-    let PositionOutput::MRope { positions, delta } = output.positions else {
-        return Err("qwen_vl pack: expected M-RoPE positions".into());
-    };
-    let mut features = Vec::new();
-    let mut grids = Vec::with_capacity(output.items.len());
-    let mut hashes = Vec::with_capacity(output.items.len());
-    for item in output.items {
-        let TensorData::F32(pixel_values) = item.feature.data else {
-            return Err("qwen_vl pack: expected f32 feature".into());
-        };
-        features.extend(pixel_values);
-        let grid = item
-            .aux
-            .into_iter()
-            .find_map(|(name, tensor)| match (name.as_str(), tensor.data) {
-                ("image_grid_thw", TensorData::I64(v)) => Some(v),
-                _ => None,
-            })
-            .ok_or("qwen_vl pack: missing image_grid_thw")?;
-        grids.push([grid[0] as u32, grid[1] as u32, grid[2] as u32]);
-        hashes.push(item.hash);
-    }
-    Ok(QwenPackedOutput {
-        input_ids: output.input_ids,
-        features,
-        grids,
-        hashes,
-        offsets: output.offsets,
-        mrope: positions,
-        mrope_delta: delta,
-    })
+    pack_grid_output(output, "qwen_vl")
 }
 
 // --- Python bindings (parity tests drive the exact server pipeline) ---
@@ -515,7 +469,7 @@ mod python {
                 let output = crate::driver::process(family.as_ref(), input, |_| {
                     Err("native parity API requires input_ids".into())
                 })?;
-                pack_output(output)
+                pack_grid_output(output, "qwen_vl")
             })
             .map_err(PyValueError::new_err)?;
         Ok((

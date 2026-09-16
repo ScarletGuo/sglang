@@ -91,7 +91,7 @@ impl MmProcessor for QwenMmProcessor {
             })?;
             tokenizer.encode(text).map_err(|error| error.to_string())
         })?;
-        let drain = sglang_mm::qwen_vl::pack_output(output)?;
+        let drain = sglang_mm::grid_packing::pack_grid_output(output, "qwen_vl")?;
         let features = if self.feature_shm {
             park_features_in_shm(&drain.features, &drain.grids)
         } else {
