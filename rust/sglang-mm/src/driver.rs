@@ -6,7 +6,7 @@
 //! cannot alter orchestration.
 
 use crate::common::{self, fetch, par, token_layout};
-use crate::pipeline::{DecodedMedia, MmFamilyProcessor, PositionOutput, ProcessedItem};
+use crate::pipeline::{MmFamilyProcessor, PositionOutput, ProcessedItem};
 
 /// Per-request bounds. Every source consumes the aggregate budget;
 /// [`fetch::MAX_FETCH_BYTES`] additionally caps each remote I/O stream.
@@ -101,10 +101,8 @@ pub fn process(
     let processed: Vec<(ProcessedItem, u64)> =
         par::try_map(&fetched, |bytes| -> Result<(ProcessedItem, u64), String> {
             let hash = common::content_hash_u64(bytes);
-            // Inputs PIL accepts but decode_rgb refuses (e.g. 16-bit PNG)
-            // error here and reject the request.
-            let (rgb, height, width) = common::decode_rgb(bytes)?;
-            let item = family.process_item(&DecodedMedia::Image { rgb, height, width })?;
+            let media = family.decode_image(bytes)?;
+            let item = family.process_item(&media)?;
             Ok((item, hash))
         })?;
 
@@ -144,6 +142,7 @@ pub fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::{DecodedMedia, Geometry, TokenLayout};
     use crate::registry::pipeline_from_spec;
 
     const SPEC: &str = r#"{"family":"qwen_vl","image_token_id":1,"patch_size":2,
@@ -176,6 +175,62 @@ mod tests {
             panic!("qwen emits mrope")
         };
         assert_eq!(positions.len(), 3 * out.input_ids.len());
+    }
+
+    // Override only decode so this test isolates the driver's dispatch.
+    // Delegate the remaining hooks to a real processor for a valid pipeline result.
+    struct CustomDecoder {
+        downstream: Box<dyn MmFamilyProcessor>,
+    }
+
+    impl MmFamilyProcessor for CustomDecoder {
+        fn decode_image(&self, bytes: &[u8]) -> Result<DecodedMedia, String> {
+            if bytes != [1, 2, 3] {
+                return Err("unexpected encoded bytes".into());
+            }
+            Ok(DecodedMedia::Image {
+                rgb: vec![7; 8 * 8 * 3],
+                height: 8,
+                width: 8,
+            })
+        }
+
+        fn process_item(&self, media: &DecodedMedia) -> Result<ProcessedItem, String> {
+            self.downstream.process_item(media)
+        }
+
+        fn layout(&self, input_ids: &[i32], items: &[Geometry]) -> Result<TokenLayout, String> {
+            self.downstream.layout(input_ids, items)
+        }
+
+        fn positions(
+            &self,
+            input_len: usize,
+            offsets: &[(u32, u32)],
+            items: &[Geometry],
+        ) -> Result<PositionOutput, String> {
+            self.downstream.positions(input_len, offsets, items)
+        }
+    }
+
+    #[test]
+    fn dispatches_decode_to_family_before_processing() {
+        let family = CustomDecoder {
+            downstream: pipeline_from_spec(SPEC).unwrap(),
+        };
+        // These bytes are not an image: the request can succeed only if the
+        // driver calls the family hook. The hash must still use these bytes.
+        let encoded = vec![1, 2, 3];
+        let expected_hash = common::content_hash_u64(&encoded);
+        let input = MmInput {
+            text: None,
+            input_ids: Some(vec![7, 1, 8]),
+            images: vec![ImageSource::Bytes(encoded)],
+        };
+        let out = process(&family, input, |_| unreachable!()).unwrap();
+        assert_eq!(out.input_ids, vec![7, 1, 1, 1, 1, 8]);
+        assert_eq!(out.items[0].hash, expected_hash);
+        assert_eq!(out.items[0].feature.shape, [16, 24]);
     }
 
     /// String sources — HTTP URL, `file://`, and bare path — all resolve to

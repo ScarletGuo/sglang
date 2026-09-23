@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use super::result_store::{
-    FeatureStore, MmEncodedEntry, MmResultStore, QwenMmEncodedEntry, park_features_in_shm,
+    FeatureStore, GridMmEncodedEntry, MmEncodedEntry, MmResultStore, park_features_in_shm,
 };
 use crate::message::config::MmSpec;
 use crate::message::ids::Rid;
@@ -64,21 +64,27 @@ pub trait MmProcessor: Send + Sync {
     ) -> Result<MmProcessOutput, String>;
 }
 
-struct QwenMmProcessor {
+struct BuiltinMmProcessor {
     family: Box<dyn sglang_mm::pipeline::MmFamilyProcessor>,
+    family_label: &'static str,
     feature_shm: bool,
 }
 
-impl QwenMmProcessor {
+impl BuiltinMmProcessor {
     fn new(spec: MmSpec) -> Result<Self, String> {
+        let family_label = match &spec.pipeline {
+            sglang_mm::registry::PipelineSpec::QwenVl(_) => "qwen_vl",
+            sglang_mm::registry::PipelineSpec::GlmVl(_) => "glm_vl",
+        };
         Ok(Self {
             family: sglang_mm::registry::build_pipeline(spec.pipeline)?,
+            family_label,
             feature_shm: spec.feature_shm,
         })
     }
 }
 
-impl MmProcessor for QwenMmProcessor {
+impl MmProcessor for BuiltinMmProcessor {
     fn process(
         &self,
         work: MmWorkItem,
@@ -91,7 +97,7 @@ impl MmProcessor for QwenMmProcessor {
             })?;
             tokenizer.encode(text).map_err(|error| error.to_string())
         })?;
-        let drain = sglang_mm::qwen_vl::pack_output(output)?;
+        let drain = sglang_mm::grid_packing::pack_grid_output(output, self.family_label)?;
         let features = if self.feature_shm {
             park_features_in_shm(&drain.features, &drain.grids)
         } else {
@@ -99,7 +105,7 @@ impl MmProcessor for QwenMmProcessor {
         };
         Ok(MmProcessOutput {
             input_ids: drain.input_ids,
-            result: MmEncodedEntry::Qwen(QwenMmEncodedEntry {
+            result: MmEncodedEntry::Grid(GridMmEncodedEntry {
                 features,
                 grids: drain.grids,
                 hashes: drain.hashes,
@@ -126,7 +132,7 @@ impl MmContext {
         results: MmResultStore,
     ) -> Result<Self, String> {
         Ok(Self {
-            processor: Arc::new(QwenMmProcessor::new(spec)?),
+            processor: Arc::new(BuiltinMmProcessor::new(spec)?),
             tokenizer,
             results,
         })
@@ -151,7 +157,7 @@ fn process(ctx: &MmContext, rid: &Rid, mut work: MmWorkItem) -> Result<Vec<i32>,
     let caller_hashes = std::mem::take(&mut work.mm_hashes);
     let mut output = ctx.processor.process(work, ctx.tokenizer.as_deref())?;
     match &mut output.result {
-        MmEncodedEntry::Qwen(entry) => apply_caller_hashes(entry.hashes.iter_mut(), &caller_hashes),
+        MmEncodedEntry::Grid(entry) => apply_caller_hashes(entry.hashes.iter_mut(), &caller_hashes),
         MmEncodedEntry::External(entry) => {
             entry.validate(output.input_ids.len())?;
             apply_caller_hashes(

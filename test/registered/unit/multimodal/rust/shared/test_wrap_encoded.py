@@ -8,6 +8,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import numpy as np
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -99,6 +100,21 @@ class TestWrapEncoded(CustomTestCase):
         self.assertEqual(
             [item.pad_value for item in output.mm_items],
             [_compute_pad_value(101), _compute_pad_value(202)],
+        )
+
+    def test_glm_uses_image_boundary_ids_in_shared_drain(self):
+        self.spec = msgspec.structs.replace(
+            self.spec,
+            family="glm_vl",
+            vision_start_token_id=21,
+            vision_end_token_id=22,
+            image_start_token_id=21,
+            image_end_token_id=22,
+        )
+        output, _ = self.build()
+        self.assertEqual(
+            (output.im_start_id, output.im_token_id, output.im_end_id),
+            (21, 10, 22),
         )
 
 

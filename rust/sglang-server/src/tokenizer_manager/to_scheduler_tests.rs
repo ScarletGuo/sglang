@@ -795,8 +795,8 @@ fn abort_cancels_parked_mm_request() {
     // The worker parks its result, as it always does before MmEncoded.
     intake.mm.results.park(
         "mm-gone".into(),
-        crate::multi_modality::result_store::MmEncodedEntry::Qwen(
-            crate::multi_modality::result_store::QwenMmEncodedEntry {
+        crate::multi_modality::result_store::MmEncodedEntry::Grid(
+            crate::multi_modality::result_store::GridMmEncodedEntry {
                 features: crate::multi_modality::result_store::FeatureStore::Inline(vec![]),
                 grids: vec![],
                 hashes: vec![],

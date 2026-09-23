@@ -9,8 +9,8 @@ use sglang_mm::pipeline::Tensor;
 
 use super::shm::{ShmSegment, shm_name};
 
-/// The built-in Qwen drain shape.
-pub struct QwenMmEncodedEntry {
+/// Shared grid-image drain shape for built-in families.
+pub struct GridMmEncodedEntry {
     pub features: FeatureStore,
     /// Per item `[t, h, w]` patch grid.
     pub grids: Vec<[u32; 3]>,
@@ -90,7 +90,7 @@ impl ExternalMmEncodedEntry {
 
 /// Encoded data parked between a multimodal worker and the scheduler drain.
 pub enum MmEncodedEntry {
-    Qwen(QwenMmEncodedEntry),
+    Grid(GridMmEncodedEntry),
     External(ExternalMmEncodedEntry),
 }
 

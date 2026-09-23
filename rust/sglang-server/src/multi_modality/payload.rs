@@ -201,6 +201,12 @@ mod tests {
         };
         assert!(to_mm_input(video).err().unwrap().contains("video/audio"));
 
+        let audio = MmWorkItem {
+            audio_data: vec![src("audio.wav")],
+            ..Default::default()
+        };
+        assert!(to_mm_input(audio).err().unwrap().contains("video/audio"));
+
         let err = to_mm_input(image_work(vec![MmItem::Preprocessed {
             format: "processor_output".into(),
         }]))

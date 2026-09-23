@@ -64,7 +64,7 @@ pub struct MmEncodedResult {
     /// `input_ids`.
     offsets: Vec<(u32, u32)>,
 
-    // Qwen-VL-specific fields.
+    // Shared grid-image fields for built-in families.
     /// Per-item `image_grid_thw` `(t, h, w)` in patch units; `t*h*w` is also the
     /// item's row count in `features`.
     grids: Vec<(u32, u32, u32)>,
@@ -116,7 +116,7 @@ impl MmEncodedResult {
         use numpy::IntoPyArray;
 
         match entry {
-            MmEncodedEntry::Qwen(entry) => {
+            MmEncodedEntry::Grid(entry) => {
                 let (features, shm_names) = match entry.features {
                     multi_modality::result_store::FeatureStore::Inline(v) => {
                         (Some(v.into_pyarray(py).unbind()), None)

@@ -7,7 +7,7 @@
 //! copies duplicated for stills) — plus the image-only M-RoPE fast path.
 //! All parameters come from the runtime spec; nothing is hardcoded per model.
 
-use crate::common::{par, resize, token_layout};
+use crate::common::{grid, resize, token_layout};
 use crate::pipeline::{
     DecodedMedia, Geometry, MmFamilyProcessor, PositionOutput, ProcessedItem, Tensor, TensorData,
     TokenLayout,
@@ -16,11 +16,7 @@ use crate::pipeline::{
 const MAX_RATIO: f64 = 200.0;
 
 /// One media item's placement for M-RoPE: inclusive token range + patch grid.
-pub struct MropeItem {
-    pub start: u32,
-    pub end: u32,
-    pub grid: [u32; 3],
-}
+pub use grid::{MropeItem, mrope_image_only};
 
 /// Resolved processor params, deserialized from the Python-side spec JSON
 /// (unknown fields like `family` are ignored here).
@@ -65,20 +61,11 @@ pub struct QwenVlProcessor {
     lut: [[f32; 256]; 3],
 }
 
-/// `1 / rescale_factor`; `resolve_spec` rejects any other factor.
-const INV_RESCALE: f32 = 255.0;
-
 /// u8 → normalized f32, rounded as the mirrored processor rounds. The slow one
 /// rescales then normalizes; the fast one folds the rescale into mean/std first
 /// (`_fuse_mean_std_and_rescale_factor`), which differs on 128 of the 256 inputs.
 fn normalize_lut(resample: Resampler, mean: f32, std: f32) -> [f32; 256] {
-    match resample {
-        Resampler::Pil => core::array::from_fn(|v| (v as f32 / INV_RESCALE - mean) / std),
-        Resampler::AtenU8 => {
-            let (mean, std) = (mean * INV_RESCALE, std * INV_RESCALE);
-            core::array::from_fn(|v| (v as f32 - mean) / std)
-        }
-    }
+    grid::normalize_lut(resample, mean, std)
 }
 
 impl QwenVlProcessor {
@@ -105,44 +92,15 @@ impl QwenVlProcessor {
     /// HF flatten: patches ordered `(gh/m, gw/m, m, m)`, features `(C, tps,
     /// ps, ps)`; parallel over merged-block rows.
     fn patchify(&self, rgb: &[u8], h: usize, w: usize) -> Vec<f32> {
-        let (ps, m, tps) = (
+        grid::patchify(
+            rgb,
+            h,
+            w,
             self.spec.patch_size,
             self.spec.merge_size,
             self.spec.temporal_patch_size,
-        );
-        let (gh, gw) = (h / ps, w / ps);
-        let dim = 3 * tps * ps * ps;
-        let block_row = gw * m * dim; // one merged-block row of patches
-        let mut out = vec![0.0f32; gh * gw * dim];
-
-        par::for_chunks_mut(&mut out, block_row, |i, chunk| {
-            let mut p = 0;
-            for j in 0..gw / m {
-                for mh in 0..m {
-                    for mw in 0..m {
-                        let y0 = (i * m + mh) * ps;
-                        let x0 = (j * m + mw) * ps;
-                        let patch = &mut chunk[p * dim..(p + 1) * dim];
-                        for c in 0..3 {
-                            let ch = &mut patch[c * tps * ps * ps..];
-                            for py in 0..ps {
-                                let src = ((y0 + py) * w + x0) * 3 + c;
-                                for px in 0..ps {
-                                    ch[py * ps + px] = self.lut[c][rgb[src + px * 3] as usize];
-                                }
-                            }
-                            // Temporal copies of a still are duplicates.
-                            let (t0, rest) = ch.split_at_mut(ps * ps);
-                            for t in 0..tps - 1 {
-                                rest[t * ps * ps..(t + 1) * ps * ps].copy_from_slice(t0);
-                            }
-                        }
-                        p += 1;
-                    }
-                }
-            }
-        });
-        out
+            &self.lut,
+        )
     }
 }
 
@@ -283,121 +241,6 @@ pub fn smart_resize(
     Ok((h_bar, w_bar))
 }
 
-/// Image-only M-RoPE fast path (the image branch of
-/// `MRotaryEmbedding.get_rope_index`, identical across Qwen generations):
-/// text runs sequentially on all three rows; each image spans `(t, h/m, w/m)`
-/// index grids; positions advance by `max(t, h/m, w/m)` past an image.
-/// Returns flattened row-major `[3, input_len]` positions and the delta
-/// (`max + 1 - input_len`). `items` must be in prompt order.
-pub fn mrope_image_only(
-    input_len: usize,
-    items: &[MropeItem],
-    merge_size: usize,
-) -> Result<(Vec<i64>, i64), String> {
-    let len = input_len;
-    let mut pos = vec![0i64; 3 * len];
-    let fill_text = |st: usize, n: usize, base: i64, pos: &mut [i64]| {
-        for k in 0..n {
-            let v = base + k as i64;
-            pos[st + k] = v;
-            pos[len + st + k] = v;
-            pos[2 * len + st + k] = v;
-        }
-    };
-    let mut st = 0usize;
-    let mut next_pos = 0i64;
-    for item in items {
-        let (start, end) = (item.start as usize, item.end as usize);
-        if start < st || end >= len {
-            return Err(format!(
-                "mrope: item range ({start},{end}) out of order/bounds"
-            ));
-        }
-        fill_text(st, start - st, next_pos, &mut pos);
-        next_pos += (start - st) as i64;
-
-        let t = item.grid[0] as usize;
-        let gh = item.grid[1] as usize / merge_size;
-        let gw = item.grid[2] as usize / merge_size;
-        if t * gh * gw != end - start + 1 {
-            return Err("mrope: token span does not match grid".into());
-        }
-        for ti in 0..t {
-            for hi in 0..gh {
-                for wi in 0..gw {
-                    let idx = start + (ti * gh + hi) * gw + wi;
-                    pos[idx] = next_pos + ti as i64;
-                    pos[len + idx] = next_pos + hi as i64;
-                    pos[2 * len + idx] = next_pos + wi as i64;
-                }
-            }
-        }
-        next_pos += (t.max(gh).max(gw)) as i64;
-        st = end + 1;
-    }
-    if st < len {
-        fill_text(st, len - st, next_pos, &mut pos);
-    }
-    let max = pos.iter().copied().max().unwrap_or(-1);
-    Ok((pos, max + 1 - len as i64))
-}
-
-/// The qwen scheduler-drain shape, extracted from the generic driver
-/// [`Output`](crate::driver::Output). Shared by `sglang-server`'s MM worker
-/// and the parity binding so the mapping can't drift. TODO(mm-families):
-/// replace with a generic named-tensor handoff once a second family needs a
-/// different shape.
-pub struct QwenPackedOutput {
-    pub input_ids: Vec<i32>,
-    /// All items' `pixel_values`, concatenated in prompt order; flattened
-    /// `[Σ t·h·w, 3·temporal_patch_size·patch_size²]`.
-    pub features: Vec<f32>,
-    /// Per item `[t, h, w]` patch grid.
-    pub grids: Vec<[u32; 3]>,
-    pub hashes: Vec<u64>,
-    /// Per item inclusive token range in `input_ids`.
-    pub offsets: Vec<(u32, u32)>,
-    /// Flattened row-major `[3, input_len]` M-RoPE positions.
-    pub mrope: Vec<i64>,
-    pub mrope_delta: i64,
-}
-
-pub fn pack_output(output: crate::driver::Output) -> Result<QwenPackedOutput, String> {
-    use crate::pipeline::PositionOutput;
-
-    let PositionOutput::MRope { positions, delta } = output.positions else {
-        return Err("qwen_vl pack: expected M-RoPE positions".into());
-    };
-    let mut features = Vec::new();
-    let mut grids = Vec::with_capacity(output.items.len());
-    let mut hashes = Vec::with_capacity(output.items.len());
-    for item in output.items {
-        let TensorData::F32(pixel_values) = item.feature.data else {
-            return Err("qwen_vl pack: expected f32 feature".into());
-        };
-        features.extend(pixel_values);
-        let grid = item
-            .aux
-            .into_iter()
-            .find_map(|(name, tensor)| match (name.as_str(), tensor.data) {
-                ("image_grid_thw", TensorData::I64(v)) => Some(v),
-                _ => None,
-            })
-            .ok_or("qwen_vl pack: missing image_grid_thw")?;
-        grids.push([grid[0] as u32, grid[1] as u32, grid[2] as u32]);
-        hashes.push(item.hash);
-    }
-    Ok(QwenPackedOutput {
-        input_ids: output.input_ids,
-        features,
-        grids,
-        hashes,
-        offsets: output.offsets,
-        mrope: positions,
-        mrope_delta: delta,
-    })
-}
-
 // --- Python bindings (parity tests drive the exact server pipeline) ---
 
 #[cfg(feature = "python")]
@@ -515,7 +358,7 @@ mod python {
                 let output = crate::driver::process(family.as_ref(), input, |_| {
                     Err("native parity API requires input_ids".into())
                 })?;
-                pack_output(output)
+                crate::grid_packing::pack_grid_output(output, "qwen_vl")
             })
             .map_err(PyValueError::new_err)?;
         Ok((

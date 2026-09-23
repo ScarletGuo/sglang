@@ -24,6 +24,7 @@ src/
 │                             #   trait + the carriers (Tensor, TokenLayout, ...)
 ├── driver.rs                 # model-independent request driver (fetch →
 │                             #   decode → process_item → layout → positions)
+├── grid_packing.rs           # shared grid + f32 feature + M-RoPE drain shape
 ├── registry.rs               # ImageProcessorSpec registry (Python-facing)
 │                             #   + pipeline_from_spec (family factory)
 ├── common/
@@ -46,12 +47,13 @@ src/
 MmInput { text?, input_ids?, images }
   1. per image: fetch_bytes (inline, sequential — see Design notes), then
        fanned out via common::par:
-       content hash → decode_rgb → family.process_item()
+       content hash → family.decode_image() → family.process_item()
                                     → ProcessedItem { feature, aux, geometry }
   2. family.layout(input_ids, geometries)   → TokenLayout
        apply_layout: expanded input_ids + per-item (start, end) offsets
   3. family.positions(len, offsets, geoms)  → Rope1D | MRope
   4. Output { input_ids, items: [{feature, aux, hash}], offsets, positions }
+  5. grid_packing::pack_grid_output → built-in worker/result store/drain
 ```
 
 The driver owns these steps and their failure semantics — any `Err` at any
@@ -71,6 +73,9 @@ the request. With qwen as the example:
     `model_specific_data`).
   - `geometry`: whatever this family's `layout`/`positions` need later.
     Qwen: the `[t, h, w]` patch grid.
+- **`decode_image`** — raw encoded bytes → `DecodedMedia`. The default uses
+  `common::decode_rgb`; a family can override image decode semantics while
+  the driver still hashes the original bytes before decoding.
 - **`layout`** — how the prompt expands, described as a value. Example: the
   prompt `[A, <pad>, B]` with one 4-token image becomes
 
@@ -101,7 +106,8 @@ feature/aux tensors to model kwargs. The carriers grow by need, not
 speculation: `DecodedMedia` gains a variant per modality (video/audio),
 `Geometry` per family style (tile sets), `TensorData` per dtype.
 
-Supported families: `qwen_vl` (Qwen2-VL / 2.5-VL / 3-VL / 3.5; images only).
+Registered image families: `qwen_vl` (Qwen2-VL / 2.5-VL / 3-VL / 3.5) and
+`glm_vl` (GLM-5.3-Flash). Both reject video and audio inputs.
 Adding one = a `MmFamilyProcessor` impl in `src/<model>/mod.rs` plus a
 `family` arm in `pipeline_from_spec`.
 

@@ -124,6 +124,13 @@ pub trait MmFamilyProcessor: Send + Sync {
         Capabilities::default()
     }
 
+    /// Decode raw encoded image bytes into the shared RGB carrier. Families
+    /// with different decode semantics can override this before processing.
+    fn decode_image(&self, bytes: &[u8]) -> Result<DecodedMedia, String> {
+        let (rgb, height, width) = crate::common::decode_rgb(bytes)?;
+        Ok(DecodedMedia::Image { rgb, height, width })
+    }
+
     /// Preprocess one decoded media item: the model's HF processor
     /// equivalent (resize/tile/normalize/patchify → named tensors) plus the
     /// geometry `layout`/`positions` will need.
