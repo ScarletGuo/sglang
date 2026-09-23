@@ -8,7 +8,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import msgspec
 import numpy as np
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -102,19 +101,43 @@ class TestWrapEncoded(CustomTestCase):
             [_compute_pad_value(101), _compute_pad_value(202)],
         )
 
-    def test_glm_uses_image_boundary_ids_in_shared_drain(self):
-        self.spec = msgspec.structs.replace(
-            self.spec,
-            family="glm_vl",
-            vision_start_token_id=21,
-            vision_end_token_id=22,
+    def test_glm_resolves_shared_video_placeholder_for_drain(self):
+        hf_config = SimpleNamespace(
+            image_token_id=10,
+            video_token_id=99,
             image_start_token_id=21,
             image_end_token_id=22,
+            video_start_token_id=23,
+            video_end_token_id=24,
         )
+        image_processor = SimpleNamespace(
+            patch_size=1,
+            merge_size=1,
+            temporal_patch_size=2,
+            patch_expand_factor=1,
+            min_image_tokens=1,
+            max_image_tokens=100,
+            image_mean=(0.0, 0.0, 0.0),
+            image_std=(1.0, 1.0, 1.0),
+        )
+        host = SimpleNamespace(_use_feature_shm=lambda: False)
+        with patch(
+            "sglang.srt.rust_server.multimodal.get_mm",
+            return_value=SimpleNamespace(mm_process_config=None),
+        ):
+            self.spec = RustMmProcessor._resolve_glm_spec(
+                host, hf_config, image_processor, "aten_u8"
+            )
+        self.assertEqual(self.spec.video_token_id, self.spec.image_token_id)
         output, _ = self.build()
         self.assertEqual(
-            (output.im_start_id, output.im_token_id, output.im_end_id),
-            (21, 10, 22),
+            (
+                output.im_start_id,
+                output.im_token_id,
+                output.im_end_id,
+                output.video_token_id,
+            ),
+            (21, 10, 22, 10),
         )
 
 

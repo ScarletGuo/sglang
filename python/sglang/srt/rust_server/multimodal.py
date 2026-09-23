@@ -310,7 +310,9 @@ class RustMmProcessor:
             resample=resample,
             vision_start_token_id=values["image_start_token_id"],
             vision_end_token_id=values["image_end_token_id"],
-            video_token_id=getattr(hf_config, "video_token_id", None),
+            # GLM video spans reuse the image placeholder after tokenization.
+            # This drain-only field mirrors Glm4vImageProcessor.mm_tokens.
+            video_token_id=values["image_token_id"],
             **values,
         )
 
