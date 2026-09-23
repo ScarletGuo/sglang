@@ -444,11 +444,16 @@ class RustServer:
         :func:`_build_server_args`; ``family`` / ``resample`` become the
         extension's ``MmFamily`` / ``MmResample`` enums)."""
         ext = cls._load_extension()
-        family = {"qwen_vl": ext.MmFamily.QwenVl}[spec.family]
+        if spec.family == "qwen_vl":
+            family = ext.MmFamily.QwenVl
+        elif spec.family == "glm_vl":
+            family = ext.MmFamily.GlmVl
+        else:
+            raise ValueError(f"unsupported Rust MM family: {spec.family}")
         resample = {"aten_u8": ext.MmResample.AtenU8, "pil": ext.MmResample.Pil}[
             spec.resample
         ]
-        return ext.MmSpec(
+        kwargs = dict(
             family=family,
             feature_shm=spec.feature_shm,
             image_token_id=spec.image_token_id,
@@ -461,3 +466,14 @@ class RustServer:
             image_std=spec.image_std,
             resample=resample,
         )
+        if spec.family == "glm_vl":
+            kwargs.update(
+                image_start_token_id=spec.image_start_token_id,
+                image_end_token_id=spec.image_end_token_id,
+                video_start_token_id=spec.video_start_token_id,
+                video_end_token_id=spec.video_end_token_id,
+                patch_expand_factor=spec.patch_expand_factor,
+                min_image_tokens=spec.min_image_tokens,
+                max_image_tokens=spec.max_image_tokens,
+            )
+        return ext.MmSpec(**kwargs)

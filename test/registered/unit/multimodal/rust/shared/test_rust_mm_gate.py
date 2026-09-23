@@ -46,6 +46,15 @@ class TestRustMmGate(CustomTestCase):
         family = rust_mm_family_for(cls, "qwen2_5_vl")
         self.assertEqual(family and family.name, "qwen_vl")
 
+    def test_glm_family_only_accepts_glm5_next(self):
+        from sglang.srt.multimodal.processors.glm4v import Glm4vImageProcessor
+
+        self.assertEqual(
+            rust_mm_family_for(Glm4vImageProcessor, "glm5_next").name, "glm_vl"
+        )
+        self.assertIsNone(rust_mm_family_for(Glm4vImageProcessor, "glm4v"))
+        self.assertIsNone(rust_mm_family_for(type("Glm4vImageProcessor", (), {}), "glm5_next"))
+
     def test_inkling_keeps_its_python_processor(self):
         from sglang.srt.multimodal.processors.inkling import InklingMultimodalProcessor
 
