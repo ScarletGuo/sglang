@@ -75,6 +75,7 @@ pub fn default_registry() -> ProcessorRegistry {
 #[serde(tag = "family", rename_all = "snake_case")]
 pub enum PipelineSpec {
     QwenVl(crate::qwen_vl::QwenVlSpec),
+    GlmVl(crate::glm_vl::GlmVlSpec),
 }
 
 /// Build a family processor from a typed spec. `Err` when the family
@@ -84,6 +85,7 @@ pub fn build_pipeline(
 ) -> Result<Box<dyn crate::pipeline::MmFamilyProcessor>, String> {
     match spec {
         PipelineSpec::QwenVl(spec) => Ok(Box::new(crate::qwen_vl::QwenVlProcessor::new(spec)?)),
+        PipelineSpec::GlmVl(_) => Err("glm_vl processor is not implemented yet".into()),
     }
 }
 
@@ -95,4 +97,20 @@ pub fn pipeline_from_spec(
 ) -> Result<Box<dyn crate::pipeline::MmFamilyProcessor>, String> {
     let spec: PipelineSpec = serde_json::from_str(json).map_err(|e| format!("mm spec: {e}"))?;
     build_pipeline(spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PipelineSpec, build_pipeline};
+
+    #[test]
+    fn glm_spec_is_typed_but_cannot_start_without_processor() {
+        let json = r#"{"family":"glm_vl","image_token_id":1,"image_start_token_id":2,"image_end_token_id":3,"video_start_token_id":4,"video_end_token_id":5,"patch_size":14,"merge_size":2,"temporal_patch_size":2,"patch_expand_factor":1,"min_image_tokens":16,"max_image_tokens":8000,"image_mean":[0.1,0.2,0.3],"image_std":[0.4,0.5,0.6],"resample":"aten_u8"}"#;
+        let spec: PipelineSpec = serde_json::from_str(json).unwrap();
+        assert!(matches!(spec, PipelineSpec::GlmVl(_)));
+        assert_eq!(
+            build_pipeline(spec).err().as_deref(),
+            Some("glm_vl processor is not implemented yet")
+        );
+    }
 }

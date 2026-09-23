@@ -456,6 +456,13 @@ impl MmSpec {
         image_mean,
         image_std,
         resample,
+        image_start_token_id=None,
+        image_end_token_id=None,
+        video_start_token_id=None,
+        video_end_token_id=None,
+        patch_expand_factor=None,
+        min_image_tokens=None,
+        max_image_tokens=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
@@ -470,8 +477,25 @@ impl MmSpec {
         image_mean: [f32; 3],
         image_std: [f32; 3],
         resample: MmResample,
-    ) -> Self {
+        image_start_token_id: Option<i32>,
+        image_end_token_id: Option<i32>,
+        video_start_token_id: Option<i32>,
+        video_end_token_id: Option<i32>,
+        patch_expand_factor: Option<usize>,
+        min_image_tokens: Option<usize>,
+        max_image_tokens: Option<usize>,
+    ) -> pyo3::PyResult<Self> {
         use sglang_mm::registry::PipelineSpec;
+        let required = |name: &str, value: Option<usize>| {
+            value.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!("glm_vl MmSpec requires {name}"))
+            })
+        };
+        let required_id = |name: &str, value: Option<i32>| {
+            value.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!("glm_vl MmSpec requires {name}"))
+            })
+        };
         let pipeline = match family {
             MmFamily::QwenVl => PipelineSpec::QwenVl(sglang_mm::qwen_vl::QwenVlSpec {
                 image_token_id,
@@ -484,11 +508,27 @@ impl MmSpec {
                 image_std,
                 resample: resample.into(),
             }),
+            MmFamily::GlmVl => PipelineSpec::GlmVl(sglang_mm::glm_vl::GlmVlSpec {
+                image_token_id,
+                image_start_token_id: required_id("image_start_token_id", image_start_token_id)?,
+                image_end_token_id: required_id("image_end_token_id", image_end_token_id)?,
+                video_start_token_id: required_id("video_start_token_id", video_start_token_id)?,
+                video_end_token_id: required_id("video_end_token_id", video_end_token_id)?,
+                patch_size,
+                merge_size,
+                temporal_patch_size,
+                patch_expand_factor: required("patch_expand_factor", patch_expand_factor)?,
+                min_image_tokens: required("min_image_tokens", min_image_tokens)?,
+                max_image_tokens: required("max_image_tokens", max_image_tokens)?,
+                image_mean,
+                image_std,
+                resample: resample.into(),
+            }),
         };
-        Self {
+        Ok(Self {
             feature_shm,
             pipeline,
-        }
+        })
     }
 }
 
@@ -504,6 +544,7 @@ impl MmSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmFamily {
     QwenVl,
+    GlmVl,
 }
 
 /// The HF image processor the Rust resize must reproduce bit-exactly (see

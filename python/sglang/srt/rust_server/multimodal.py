@@ -40,6 +40,14 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
     vision_start_token_id: Optional[int]
     vision_end_token_id: Optional[int]
     video_token_id: Optional[int]
+    # GLM-only processor contract. None keeps the Qwen handoff unchanged.
+    image_start_token_id: Optional[int] = None
+    image_end_token_id: Optional[int] = None
+    video_start_token_id: Optional[int] = None
+    video_end_token_id: Optional[int] = None
+    patch_expand_factor: Optional[int] = None
+    min_image_tokens: Optional[int] = None
+    max_image_tokens: Optional[int] = None
 
     # Used by the drain adapter only; every other field goes to Rust.
     DRAIN_ONLY = ("vision_start_token_id", "vision_end_token_id", "video_token_id")
@@ -53,7 +61,9 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
         JSON form the ``_multimodal`` parity API takes; the server itself is
         handed the typed ``MmSpec`` instead."""
         fields = (f for f in self.__struct_fields__ if f not in self.DRAIN_ONLY)
-        return msgspec.json.encode({f: getattr(self, f) for f in fields}).decode()
+        return msgspec.json.encode(
+            {f: getattr(self, f) for f in fields if getattr(self, f) is not None}
+        ).decode()
 
 
 class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
@@ -74,9 +84,11 @@ class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
     image_processors: Dict[str, str]
 
     def serves(self, mm_processor_cls: Any, model_type: Optional[str]) -> bool:
+        if model_type not in self.model_types:
+            return False
         module_name, _, class_name = self.mm_processor.partition(":")
         cls = getattr(importlib.import_module(module_name), class_name)
-        return mm_processor_cls is cls and model_type in self.model_types
+        return mm_processor_cls is cls
 
 
 RUST_MM_FAMILIES: Tuple[RustMmFamily, ...] = (
@@ -97,6 +109,15 @@ RUST_MM_FAMILIES: Tuple[RustMmFamily, ...] = (
             "Qwen2VLImageProcessor": "aten_u8",
             "Qwen2VLImageProcessorFast": "aten_u8",
             "Qwen2VLImageProcessorPil": "pil",
+        },
+    ),
+    RustMmFamily(
+        name="glm_vl",
+        mm_processor="sglang.srt.multimodal.processors.glm4v:Glm4vImageProcessor",
+        model_types=frozenset(("glm5_next",)),
+        image_processors={
+            "Glm5NextImageProcessor": "aten_u8",
+            "Glm5NextImageProcessorPil": "pil",
         },
     ),
 )
@@ -187,6 +208,9 @@ class RustMmProcessor:
         if getattr(image_processor, "rescale_factor", None) != 1 / 255:
             return None
 
+        if family.name == "glm_vl":
+            return self._resolve_glm_spec(hf_config, image_processor, resample)
+
         # `--mm-process-config {"image": {...}}`: only pixel-limit overrides are
         # mirrored by Rust; anything else disables the pipeline.
         image_overrides = dict((get_mm().mm_process_config or {}).get("image", {}))
@@ -223,6 +247,72 @@ class RustMmProcessor:
             return None
         logger.info("rust server: Rust MM pipeline enabled (family=%s)", family.name)
         return spec
+
+    def _resolve_glm_spec(self, hf_config, image_processor, resample):
+        # GLM uses token budgets, not the Qwen pixel limits. Read every value
+        # from the loaded processor/config and reject missing or invalid data.
+        if (get_mm().mm_process_config or {}).get("image"):
+            return None
+        try:
+            values = {
+                name: int(getattr(hf_config, name))
+                for name in (
+                    "image_token_id",
+                    "image_start_token_id",
+                    "image_end_token_id",
+                    "video_start_token_id",
+                    "video_end_token_id",
+                )
+            }
+            values.update(
+                (name, int(getattr(image_processor, name)))
+                for name in (
+                    "patch_size",
+                    "merge_size",
+                    "temporal_patch_size",
+                    "patch_expand_factor",
+                    "min_image_tokens",
+                    "max_image_tokens",
+                )
+            )
+            mean = tuple(float(x) for x in image_processor.image_mean)
+            std = tuple(float(x) for x in image_processor.image_std)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if (
+            any(
+                values[name] <= 0
+                for name in (
+                    "patch_size",
+                    "merge_size",
+                    "temporal_patch_size",
+                    "patch_expand_factor",
+                    "min_image_tokens",
+                    "max_image_tokens",
+                )
+            )
+            or values["min_image_tokens"] > values["max_image_tokens"]
+            or len(mean) != 3
+            or len(std) != 3
+            or any(x <= 0 for x in std)
+        ):
+            return None
+        return RustMmSpec(
+            family="glm_vl",
+            feature_shm=self._use_feature_shm(),
+            patch_size=values["patch_size"],
+            merge_size=values["merge_size"],
+            temporal_patch_size=values["temporal_patch_size"],
+            min_pixels=0,
+            max_pixels=0,
+            image_mean=mean,
+            image_std=std,
+            resample=resample,
+            vision_start_token_id=values["image_start_token_id"],
+            vision_end_token_id=values["image_end_token_id"],
+            video_token_id=getattr(hf_config, "video_token_id", None),
+            **values,
+        )
 
     def _use_feature_shm(self) -> bool:
         """Whether to park feature buffers in POSIX shm rather than inline.
