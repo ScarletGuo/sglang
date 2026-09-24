@@ -82,6 +82,22 @@ class RustServer:
         )
         mm_spec = mm_host.resolve_spec()
         if mm_spec is None:
+            model_type = scheduler.model_config.hf_config.model_type
+            if model_type == "glm5_next":
+                from sglang.srt.environ import envs
+
+                if not envs.SGLANG_RUST_MM_GLM5_NEXT.get():
+                    raise RuntimeError(
+                        "SGLANG_RUST_SERVER=1: GLM-5.3-Flash Rust image "
+                        "pipeline requires SGLANG_RUST_MM_GLM5_NEXT=1. "
+                        "Unset SGLANG_RUST_SERVER to use the non-Rust server."
+                    )
+                raise RuntimeError(
+                    "SGLANG_RUST_SERVER=1: unsupported GLM-5.3-Flash Rust MM "
+                    "profile. Requires transformers==5.17.0, a recognized "
+                    "image processor/backend, the validated image settings, "
+                    "and no MM processing overrides."
+                )
             supported = sorted(
                 set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
             )

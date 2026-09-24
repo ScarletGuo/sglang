@@ -8,8 +8,10 @@ processor and never match a Rust family, so growing the registry cannot
 silently reroute them.
 """
 
+import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -43,7 +45,8 @@ class TestRustMmGate(CustomTestCase):
 
     def test_qwen_vl_resolves_its_family(self):
         cls = processor_cls_for("Qwen2_5_VLForConditionalGeneration", "qwen2_5_vl")
-        family = rust_mm_family_for(cls, "qwen2_5_vl")
+        with patch.dict(os.environ, {"SGLANG_RUST_MM_GLM5_NEXT": "0"}):
+            family = rust_mm_family_for(cls, "qwen2_5_vl")
         self.assertEqual(family and family.name, "qwen_vl")
 
     def test_glm_family_only_accepts_glm5_next(self):

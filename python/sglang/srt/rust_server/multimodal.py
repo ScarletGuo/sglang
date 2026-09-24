@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 import logging
+import math
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Optional, Tuple
 
 import msgspec
@@ -122,6 +124,67 @@ RUST_MM_FAMILIES: Tuple[RustMmFamily, ...] = (
     ),
 )
 
+# The only GLM processor profile checked against the pinned HF 5.17.0
+# reference. The PIL subclass retains the base image_processor_type string.
+_GLM_IMAGE_PROCESSOR_MODULES = {
+    "aten_u8": "transformers.models.glm5_next.image_processing_glm5_next",
+    "pil": "transformers.models.glm5_next.image_processing_pil_glm5_next",
+}
+_GLM_PROCESSOR_MODULE = "transformers.models.glm5_next.processing_glm5_next"
+_GLM_IMAGE_PROFILE = {
+    "image_processor_type": "Glm5NextImageProcessor",
+    "patch_size": 14,
+    "temporal_patch_size": 2,
+    "merge_size": 2,
+    "patch_expand_factor": 1,
+    "min_image_tokens": 16,
+    "max_image_tokens": 8000,
+    "do_convert_rgb": True,
+    "do_resize": True,
+    "do_rescale": True,
+    "do_normalize": True,
+    "resample": 3,
+    "rescale_factor": 1 / 255,
+    "size": {"longest_edge": 1},
+    "image_mean": (0.48145466, 0.4578275, 0.40821073),
+    "image_std": (0.26862954, 0.26130258, 0.27577711),
+}
+
+
+def _glm_image_profile_matches(image_processor: Any, resample: str) -> bool:
+    cls = type(image_processor)
+    if cls.__module__ != _GLM_IMAGE_PROCESSOR_MODULES[resample]:
+        return False
+    try:
+        config = image_processor.to_dict()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if not isinstance(config, dict) or set(config) != set(_GLM_IMAGE_PROFILE):
+        return False
+    for name, expected in _GLM_IMAGE_PROFILE.items():
+        actual = config[name]
+        if name in ("image_mean", "image_std"):
+            try:
+                actual = tuple(actual)
+            except TypeError:
+                return False
+            if not all(isinstance(x, (int, float)) and math.isfinite(x) for x in actual):
+                return False
+        if actual != expected:
+            return False
+        if name == "image_processor_type":
+            continue  # inserted by HF to_dict(); it need not be an instance attr
+        attr = getattr(image_processor, name, None)
+        if name in ("image_mean", "image_std"):
+            try:
+                attr = tuple(attr)
+            except TypeError:
+                return False
+        if attr != expected:
+            return False
+    backend = getattr(image_processor, "backend", None)
+    return backend == ("pil" if resample == "pil" else "torchvision")
+
 
 def rust_mm_family_for(
     mm_processor_cls: Any, model_type: Optional[str]
@@ -195,10 +258,28 @@ class RustMmProcessor:
         )
         if family is None:
             return None
+        if family.name == "glm_vl":
+            if not envs.SGLANG_RUST_MM_GLM5_NEXT.get():
+                return None
+            try:
+                if version("transformers") != "5.17.0":
+                    return None
+            except PackageNotFoundError:
+                return None
+            cls = type(self._processor)
+            if (
+                cls.__module__ != _GLM_PROCESSOR_MODULE
+                or cls.__name__ != "Glm5NextProcessor"
+            ):
+                return None
         image_processor = getattr(self._processor, "image_processor", None)
         resample = family.image_processors.get(type(image_processor).__name__)
         if resample is None:
             return None
+        if family.name == "glm_vl":
+            if not _glm_image_profile_matches(image_processor, resample):
+                return None
+            return self._resolve_glm_spec(hf_config, image_processor, resample)
         # The Rust pipeline always resizes, rescales by 1/255 and normalizes;
         # Rust's fused normalize constants assume that factor. Anything else
         # would silently produce different features.
@@ -207,9 +288,6 @@ class RustMmProcessor:
             return None
         if getattr(image_processor, "rescale_factor", None) != 1 / 255:
             return None
-
-        if family.name == "glm_vl":
-            return self._resolve_glm_spec(hf_config, image_processor, resample)
 
         # `--mm-process-config {"image": {...}}`: only pixel-limit overrides are
         # mirrored by Rust; anything else disables the pipeline.
@@ -251,7 +329,7 @@ class RustMmProcessor:
     def _resolve_glm_spec(self, hf_config, image_processor, resample):
         # GLM uses token budgets, not the Qwen pixel limits. Read every value
         # from the loaded processor/config and reject missing or invalid data.
-        if (get_mm().mm_process_config or {}).get("image"):
+        if get_mm().mm_process_config:
             return None
         try:
             values = {
@@ -277,10 +355,20 @@ class RustMmProcessor:
             )
             mean = tuple(float(x) for x in image_processor.image_mean)
             std = tuple(float(x) for x in image_processor.image_std)
-        except (AttributeError, TypeError, ValueError):
+        except (AttributeError, OverflowError, TypeError, ValueError):
             return None
         if (
             any(
+                not 0 <= values[name] <= 2**31 - 1
+                for name in (
+                    "image_token_id",
+                    "image_start_token_id",
+                    "image_end_token_id",
+                    "video_start_token_id",
+                    "video_end_token_id",
+                )
+            )
+            or any(
                 values[name] <= 0
                 for name in (
                     "patch_size",
@@ -300,9 +388,6 @@ class RustMmProcessor:
         return RustMmSpec(
             family="glm_vl",
             feature_shm=self._use_feature_shm(),
-            patch_size=values["patch_size"],
-            merge_size=values["merge_size"],
-            temporal_patch_size=values["temporal_patch_size"],
             min_pixels=0,
             max_pixels=0,
             image_mean=mean,
