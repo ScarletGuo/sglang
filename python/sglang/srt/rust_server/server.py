@@ -82,6 +82,14 @@ class RustServer:
         )
         mm_spec = mm_host.resolve_spec()
         if mm_spec is None:
+            model_type = scheduler.model_config.hf_config.model_type
+            if model_type == "glm5_next":
+                raise RuntimeError(
+                    "SGLANG_RUST_SERVER=1: unsupported GLM-5.3-Flash Rust MM "
+                    "profile. Requires a recognized image processor/backend, "
+                    "the validated image settings, and no MM processing "
+                    "overrides."
+                )
             supported = sorted(
                 set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
             )
