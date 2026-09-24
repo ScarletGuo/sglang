@@ -369,6 +369,100 @@ fn composite_alpha(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
         .collect()
 }
 
+// Expose the production family pipeline for HF parity checks. No image
+// preprocessing algorithm is duplicated in these bindings.
+#[cfg(feature = "python")]
+mod python {
+    use numpy::{IntoPyArray, PyArray1};
+    use pyo3::exceptions::PyValueError;
+    use pyo3::prelude::*;
+
+    use super::*;
+
+    type PyProcessedImage<'py> = (Bound<'py, PyArray1<f32>>, (u32, u32, u32));
+    type PyNativeOutput<'py> = (
+        Vec<i32>,
+        Bound<'py, PyArray1<f32>>,
+        Vec<(u32, u32, u32)>,
+        Vec<u64>,
+        Vec<(u32, u32)>,
+        Bound<'py, PyArray1<i64>>,
+        i64,
+    );
+
+    /// Decode and preprocess one encoded image through the GLM server family.
+    #[pyfunction]
+    fn preprocess<'py>(
+        py: Python<'py>,
+        data: Vec<u8>,
+        spec_json: String,
+    ) -> PyResult<PyProcessedImage<'py>> {
+        let result = py
+            .detach(move || {
+                let family = crate::registry::pipeline_from_spec(&spec_json)?;
+                let media = family.decode_image(&data)?;
+                family.process_item(&media)
+            })
+            .map_err(PyValueError::new_err)?;
+        let Geometry::Grid([t, h, w]) = result.geometry;
+        let TensorData::F32(values) = result.feature.data else {
+            return Err(PyValueError::new_err("glm_vl: expected f32 feature"));
+        };
+        Ok((values.into_pyarray(py), (t, h, w)))
+    }
+
+    /// Run the real driver and packer for a tokenized image request.
+    #[pyfunction]
+    fn process_mm<'py>(
+        py: Python<'py>,
+        input_ids: Vec<i32>,
+        images: Vec<Vec<u8>>,
+        spec_json: String,
+    ) -> PyResult<PyNativeOutput<'py>> {
+        let packed = py
+            .detach(move || {
+                let family = crate::registry::pipeline_from_spec(&spec_json)?;
+                let input = crate::driver::MmInput {
+                    text: None,
+                    input_ids: Some(input_ids),
+                    images: images
+                        .into_iter()
+                        .map(crate::driver::ImageSource::Bytes)
+                        .collect(),
+                };
+                let output = crate::driver::process(family.as_ref(), input, |_| {
+                    Err("GLM parity API requires input_ids".into())
+                })?;
+                crate::grid_packing::pack_grid_output(output, "glm_vl")
+            })
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            packed.input_ids,
+            packed.features.into_pyarray(py),
+            packed
+                .grids
+                .into_iter()
+                .map(|[t, h, w]| (t, h, w))
+                .collect(),
+            packed.hashes,
+            packed.offsets,
+            packed.mrope.into_pyarray(py),
+            packed.mrope_delta,
+        ))
+    }
+
+    pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
+        let m = PyModule::new(parent.py(), "glm_vl")?;
+        m.add_function(wrap_pyfunction!(preprocess, &m)?)?;
+        m.add_function(wrap_pyfunction!(process_mm, &m)?)?;
+        parent.add_submodule(&m)?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "python")]
+pub use python::register;
+
 #[cfg(test)]
 mod tests {
     use super::*;
